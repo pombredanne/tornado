@@ -23,6 +23,8 @@ try:
 except ImportError:
     pass
 
+kwargs = {}
+
 # Build the epoll extension for Linux systems with Python < 2.6
 extensions = []
 major, minor = sys.version_info[:2]
@@ -31,15 +33,31 @@ if "linux" in sys.platform.lower() and not python_26:
     extensions.append(distutils.core.Extension(
         "tornado.epoll", ["tornado/epoll.c"]))
 
-version = "1.2.1"
+version = "2.4.post2"
+
+if major >= 3:
+    import setuptools  # setuptools is required for use_2to3
+    kwargs["use_2to3"] = True
 
 distutils.core.setup(
     name="tornado",
     version=version,
-    packages = ["tornado", "tornado.test"],
+    packages = ["tornado", "tornado.test", "tornado.platform"],
     package_data = {
         "tornado": ["ca-certificates.crt"],
-        "tornado.test": ["README", "test.crt", "test.key"],
+        # data files need to be listed both here (which determines what gets
+        # installed) and in MANIFEST.in (which determines what gets included
+        # in the sdist tarball)
+        "tornado.test": [
+            "README",
+            "test.crt",
+            "test.key",
+            "static/robots.txt",
+            "templates/utf8.html",
+            "csv_translations/fr_FR.csv",
+            "gettext_translations/fr_FR/LC_MESSAGES/tornado_test.mo",
+            "gettext_translations/fr_FR/LC_MESSAGES/tornado_test.po",
+            ],
         },
     ext_modules = extensions,
     author="Facebook",
@@ -48,4 +66,5 @@ distutils.core.setup(
     download_url="http://github.com/downloads/facebook/tornado/tornado-%s.tar.gz" % version,
     license="http://www.apache.org/licenses/LICENSE-2.0",
     description="Tornado is an open source version of the scalable, non-blocking web server and and tools that power FriendFeed",
+    **kwargs
 )
