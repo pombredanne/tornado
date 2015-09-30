@@ -43,7 +43,6 @@ class Application(tornado.web.Application):
             template_path=os.path.join(os.path.dirname(__file__), "templates"),
             static_path=os.path.join(os.path.dirname(__file__), "static"),
             xsrf_cookies=True,
-            autoescape=None,
         )
         tornado.web.Application.__init__(self, handlers, **settings)
 
@@ -57,9 +56,9 @@ class ChatSocketHandler(tornado.websocket.WebSocketHandler):
     cache = []
     cache_size = 200
 
-    def allow_draft76(self):
-        # for iOS 5.0 Safari
-        return True
+    def get_compression_options(self):
+        # Non-None enables compression with default options.
+        return {}
 
     def open(self):
         ChatSocketHandler.waiters.add(self)
@@ -89,7 +88,8 @@ class ChatSocketHandler(tornado.websocket.WebSocketHandler):
             "id": str(uuid.uuid4()),
             "body": parsed["body"],
             }
-        chat["html"] = self.render_string("message.html", message=chat)
+        chat["html"] = tornado.escape.to_basestring(
+            self.render_string("message.html", message=chat))
 
         ChatSocketHandler.update_cache(chat)
         ChatSocketHandler.send_updates(chat)
@@ -99,7 +99,7 @@ def main():
     tornado.options.parse_command_line()
     app = Application()
     app.listen(options.port)
-    tornado.ioloop.IOLoop.instance().start()
+    tornado.ioloop.IOLoop.current().start()
 
 
 if __name__ == "__main__":

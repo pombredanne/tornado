@@ -14,57 +14,164 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import distutils.core
+import os
+import platform
 import sys
-# Importing setuptools adds some features like "setup.py develop", but
-# it's optional so swallow the error if it's not there.
+import warnings
+
 try:
+    # Use setuptools if available, for install_requires (among other things).
     import setuptools
+    from setuptools import setup
 except ImportError:
-    pass
+    setuptools = None
+    from distutils.core import setup
+
+from distutils.core import Extension
+
+# The following code is copied from
+# https://github.com/mongodb/mongo-python-driver/blob/master/setup.py
+# to support installing without the extension on platforms where
+# no compiler is available.
+from distutils.command.build_ext import build_ext
+
+
+class custom_build_ext(build_ext):
+    """Allow C extension building to fail.
+
+    The C extension speeds up websocket masking, but is not essential.
+    """
+
+    warning_message = """
+********************************************************************
+WARNING: %s could not
+be compiled. No C extensions are essential for Tornado to run,
+although they do result in significant speed improvements for
+websockets.
+%s
+
+Here are some hints for popular operating systems:
+
+If you are seeing this message on Linux you probably need to
+install GCC and/or the Python development package for your
+version of Python.
+
+Debian and Ubuntu users should issue the following command:
+
+    $ sudo apt-get install build-essential python-dev
+
+RedHat, CentOS, and Fedora users should issue the following command:
+
+    $ sudo yum install gcc python-devel
+
+If you are seeing this message on OSX please read the documentation
+here:
+
+http://api.mongodb.org/python/current/installation.html#osx
+********************************************************************
+"""
+
+    def run(self):
+        try:
+            build_ext.run(self)
+        except Exception:
+            e = sys.exc_info()[1]
+            sys.stdout.write('%s\n' % str(e))
+            warnings.warn(self.warning_message % ("Extension modules",
+                                                  "There was an issue with "
+                                                  "your platform configuration"
+                                                  " - see above."))
+
+    def build_extension(self, ext):
+        name = ext.name
+        try:
+            build_ext.build_extension(self, ext)
+        except Exception:
+            e = sys.exc_info()[1]
+            sys.stdout.write('%s\n' % str(e))
+            warnings.warn(self.warning_message % ("The %s extension "
+                                                  "module" % (name,),
+                                                  "The output above "
+                                                  "this warning shows how "
+                                                  "the compilation "
+                                                  "failed."))
+
 
 kwargs = {}
 
-# Build the epoll extension for Linux systems with Python < 2.6
-extensions = []
-major, minor = sys.version_info[:2]
-python_26 = (major > 2 or (major == 2 and minor >= 6))
-if "linux" in sys.platform.lower() and not python_26:
-    extensions.append(distutils.core.Extension(
-        "tornado.epoll", ["tornado/epoll.c"]))
+version = "4.3.dev1"
 
-version = "2.4.post2"
+with open('README.rst') as f:
+    kwargs['long_description'] = f.read()
 
-if major >= 3:
-    import setuptools  # setuptools is required for use_2to3
-    kwargs["use_2to3"] = True
+if (platform.python_implementation() == 'CPython' and
+        os.environ.get('TORNADO_EXTENSION') != '0'):
+    # This extension builds and works on pypy as well, although pypy's jit
+    # produces equivalent performance.
+    kwargs['ext_modules'] = [
+        Extension('tornado.speedups',
+                  sources=['tornado/speedups.c']),
+    ]
 
-distutils.core.setup(
+    if os.environ.get('TORNADO_EXTENSION') != '1':
+        # Unless the user has specified that the extension is mandatory,
+        # fall back to the pure-python implementation on any build failure.
+        kwargs['cmdclass'] = {'build_ext': custom_build_ext}
+
+
+if setuptools is not None:
+    # If setuptools is not available, you're on your own for dependencies.
+    install_requires = []
+    if sys.version_info < (3, 2):
+        install_requires.append('backports.ssl_match_hostname')
+    if sys.version_info < (3, 4):
+        # Certifi is also optional on 2.7.9+, although making our dependencies
+        # conditional on micro version numbers seems like a bad idea
+        # until we have more declarative metadata.
+        install_requires.append('certifi')
+    kwargs['install_requires'] = install_requires
+
+setup(
     name="tornado",
     version=version,
-    packages = ["tornado", "tornado.test", "tornado.platform"],
-    package_data = {
-        "tornado": ["ca-certificates.crt"],
+    packages=["tornado", "tornado.test", "tornado.platform"],
+    package_data={
         # data files need to be listed both here (which determines what gets
         # installed) and in MANIFEST.in (which determines what gets included
         # in the sdist tarball)
         "tornado.test": [
             "README",
-            "test.crt",
-            "test.key",
-            "static/robots.txt",
-            "templates/utf8.html",
             "csv_translations/fr_FR.csv",
             "gettext_translations/fr_FR/LC_MESSAGES/tornado_test.mo",
             "gettext_translations/fr_FR/LC_MESSAGES/tornado_test.po",
+            "options_test.cfg",
+            "static/robots.txt",
+            "static/sample.xml",
+            "static/sample.xml.gz",
+            "static/sample.xml.bz2",
+            "static/dir/index.html",
+            "static_foo.txt",
+            "templates/utf8.html",
+            "test.crt",
+            "test.key",
             ],
         },
-    ext_modules = extensions,
     author="Facebook",
     author_email="python-tornado@googlegroups.com",
     url="http://www.tornadoweb.org/",
-    download_url="http://github.com/downloads/facebook/tornado/tornado-%s.tar.gz" % version,
     license="http://www.apache.org/licenses/LICENSE-2.0",
-    description="Tornado is an open source version of the scalable, non-blocking web server and and tools that power FriendFeed",
+    description="Tornado is a Python web framework and asynchronous networking library, originally developed at FriendFeed.",
+    classifiers=[
+        'License :: OSI Approved :: Apache Software License',
+        'Programming Language :: Python :: 2',
+        'Programming Language :: Python :: 2.6',
+        'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.2',
+        'Programming Language :: Python :: 3.3',
+        'Programming Language :: Python :: 3.4',
+        'Programming Language :: Python :: Implementation :: CPython',
+        'Programming Language :: Python :: Implementation :: PyPy',
+        ],
     **kwargs
 )

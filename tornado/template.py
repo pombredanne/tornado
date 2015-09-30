@@ -21,7 +21,7 @@ Basic usage looks like::
     t = template.Template("<html>{{ myvalue }}</html>")
     print t.generate(myvalue="XXX")
 
-Loader is a class that loads templates from a root directory and caches
+`Loader` is a class that loads templates from a root directory and caches
 the compiled templates::
 
     loader = template.Loader("/home/btaylor")
@@ -56,16 +56,17 @@ interesting. Syntax for the templates::
     {% end %}
 
 Unlike most other template systems, we do not put any restrictions on the
-expressions you can include in your statements. if and for blocks get
-translated exactly into Python, you can do complex expressions like::
+expressions you can include in your statements. ``if`` and ``for`` blocks get
+translated exactly into Python, so you can do complex expressions like::
 
    {% for student in [p for p in people if p.student and p.age > 23] %}
      <li>{{ escape(student.name) }}</li>
    {% end %}
 
 Translating directly to Python means you can apply functions to expressions
-easily, like the escape() function in the examples above. You can pass
-functions in to your template just like any other variable::
+easily, like the ``escape()`` function in the examples above. You can pass
+functions in to your template just like any other variable
+(In a `.RequestHandler`, override `.RequestHandler.get_template_namespace`)::
 
    ### Python code
    def add(x, y):
@@ -75,13 +76,17 @@ functions in to your template just like any other variable::
    ### The template
    {{ add(1, 2) }}
 
-We provide the functions escape(), url_escape(), json_encode(), and squeeze()
-to all templates by default.
+We provide the functions `escape() <.xhtml_escape>`, `.url_escape()`,
+`.json_encode()`, and `.squeeze()` to all templates by default.
 
 Typical applications do not create `Template` or `Loader` instances by
-hand, but instead use the `render` and `render_string` methods of
+hand, but instead use the `~.RequestHandler.render` and
+`~.RequestHandler.render_string` methods of
 `tornado.web.RequestHandler`, which load templates automatically based
-on the ``template_path`` `Application` setting.
+on the ``template_path`` `.Application` setting.
+
+Variable names beginning with ``_tt_`` are reserved by the template
+system and should not be used by application code.
 
 Syntax Reference
 ----------------
@@ -109,7 +114,7 @@ with ``{# ... #}``.
 ``{% autoescape *function* %}``
     Sets the autoescape mode for the current file.  This does not affect
     other files, even those referenced by ``{% include %}``.  Note that
-    autoescaping can also be configured globally, at the `Application`
+    autoescaping can also be configured globally, at the `.Application`
     or `Loader`.::
 
         {% autoescape xhtml_escape %}
@@ -165,23 +170,31 @@ with ``{# ... #}``.
 
         {% module Template("foo.html", arg=42) %}
 
+    ``UIModules`` are a feature of the `tornado.web.RequestHandler`
+    class (and specifically its ``render`` method) and will not work
+    when the template system is used on its own in other contexts.
+
 ``{% raw *expr* %}``
     Outputs the result of the given expression without autoescaping.
 
 ``{% set *x* = *y* %}``
     Sets a local variable.
 
-``{% try %}...{% except %}...{% finally %}...{% else %}...{% end %}``
+``{% try %}...{% except %}...{% else %}...{% finally %}...{% end %}``
     Same as the python ``try`` statement.
 
 ``{% while *condition* %}... {% end %}``
     Same as the python ``while`` statement.  ``{% break %}`` and
     ``{% continue %}`` may be used inside the loop.
+
+``{% whitespace *mode* %}``
+    Sets the whitespace mode for the remainder of the current file
+    (or until the next ``{% whitespace %}`` directive). See
+    `filter_whitespace` for available options. New in Tornado 4.3.
 """
 
-from __future__ import absolute_import, division, with_statement
+from __future__ import absolute_import, division, print_function, with_statement
 
-import cStringIO
 import datetime
 import linecache
 import os.path
@@ -191,10 +204,40 @@ import threading
 
 from tornado import escape
 from tornado.log import app_log
-from tornado.util import bytes_type, ObjectDict
+from tornado.util import ObjectDict, exec_in, unicode_type
+
+try:
+    from cStringIO import StringIO  # py2
+except ImportError:
+    from io import StringIO  # py3
 
 _DEFAULT_AUTOESCAPE = "xhtml_escape"
 _UNSET = object()
+
+
+def filter_whitespace(mode, text):
+    """Transform whitespace in ``text`` according to ``mode``.
+
+    Available modes are:
+
+    * ``all``: Return all whitespace unmodified.
+    * ``single``: Collapse consecutive whitespace with a single whitespace
+      character, preserving newlines.
+    * ``oneline``: Collapse all runs of whitespace into a single space
+      character, removing all newlines in the process.
+
+    .. versionadded:: 4.3
+    """
+    if mode == 'all':
+        return text
+    elif mode == 'single':
+        text = re.sub(r"([\t ]+)", " ", text)
+        text = re.sub(r"(\s*\n\s*)", "\n", text)
+        return text
+    elif mode == 'oneline':
+        return re.sub(r"(\s+)", " ", text)
+    else:
+        raise Exception("invalid whitespace mode %s" % mode)
 
 
 class Template(object):
@@ -207,29 +250,68 @@ class Template(object):
     # autodoc because _UNSET looks like garbage.  When changing
     # this signature update website/sphinx/template.rst too.
     def __init__(self, template_string, name="<string>", loader=None,
-                 compress_whitespace=None, autoescape=_UNSET):
-        self.name = name
-        if compress_whitespace is None:
-            compress_whitespace = name.endswith(".html") or \
-                name.endswith(".js")
+                 compress_whitespace=_UNSET, autoescape=_UNSET,
+                 whitespace=None):
+        """Construct a Template.
+
+        :arg str template_string: the contents of the template file.
+        :arg str name: the filename from which the template was loaded
+            (used for error message).
+        :arg tornado.template.BaseLoader loader: the `~tornado.template.BaseLoader` responsible for this template,
+            used to resolve ``{% include %}`` and ``{% extend %}``
+            directives.
+        :arg bool compress_whitespace: Deprecated since Tornado 4.3.
+            Equivalent to ``whitespace="single"`` if true and
+            ``whitespace="all"`` if false.
+        :arg str autoescape: The name of a function in the template
+            namespace, or ``None`` to disable escaping by default.
+        :arg str whitespace: A string specifying treatment of whitespace;
+            see `filter_whitespace` for options.
+
+        .. versionchanged:: 4.3
+           Added ``whitespace`` parameter; deprecated ``compress_whitespace``.
+        """
+        self.name = escape.native_str(name)
+
+        if compress_whitespace is not _UNSET:
+            # Convert deprecated compress_whitespace (bool) to whitespace (str).
+            if whitespace is not None:
+                raise Exception("cannot set both whitespace and compress_whitespace")
+            whitespace = "single" if compress_whitespace else "all"
+        if whitespace is None:
+            if loader and loader.whitespace:
+                whitespace = loader.whitespace
+            else:
+                # Whitespace defaults by filename.
+                if name.endswith(".html") or name.endswith(".js"):
+                    whitespace = "single"
+                else:
+                    whitespace = "all"
+        # Validate the whitespace setting.
+        filter_whitespace(whitespace, '')
+
         if autoescape is not _UNSET:
             self.autoescape = autoescape
         elif loader:
             self.autoescape = loader.autoescape
         else:
             self.autoescape = _DEFAULT_AUTOESCAPE
+
         self.namespace = loader.namespace if loader else {}
-        reader = _TemplateReader(name, escape.native_str(template_string))
+        reader = _TemplateReader(name, escape.native_str(template_string),
+                                 whitespace)
         self.file = _File(self, _parse(reader, self))
-        self.code = self._generate_python(loader, compress_whitespace)
+        self.code = self._generate_python(loader)
         self.loader = loader
         try:
             # Under python2.5, the fake filename used here must match
             # the module name used in __name__ below.
+            # The dont_inherit flag prevents template.py's future imports
+            # from being applied to the generated code.
             self.compiled = compile(
                 escape.to_unicode(self.code),
                 "%s.generated.py" % self.name.replace('.', '_'),
-                "exec")
+                "exec", dont_inherit=True)
         except Exception:
             formatted_code = _format_code(self.code).rstrip()
             app_log.error("%s code:\n%s", self.name, formatted_code)
@@ -245,8 +327,8 @@ class Template(object):
             "squeeze": escape.squeeze,
             "linkify": escape.linkify,
             "datetime": datetime,
-            "_utf8": escape.utf8,  # for internal use
-            "_string_types": (unicode, bytes_type),
+            "_tt_utf8": escape.utf8,  # for internal use
+            "_tt_string_types": (unicode_type, bytes),
             # __name__ and __loader__ allow the traceback mechanism to find
             # the generated source code.
             "__name__": self.name.replace('.', '_'),
@@ -254,16 +336,16 @@ class Template(object):
         }
         namespace.update(self.namespace)
         namespace.update(kwargs)
-        exec self.compiled in namespace
-        execute = namespace["_execute"]
+        exec_in(self.compiled, namespace)
+        execute = namespace["_tt_execute"]
         # Clear the traceback module's cache of source data now that
         # we've generated a new template (mainly for this module's
         # unittests, where different tests reuse the same name).
         linecache.clearcache()
         return execute()
 
-    def _generate_python(self, loader, compress_whitespace):
-        buffer = cStringIO.StringIO()
+    def _generate_python(self, loader):
+        buffer = StringIO()
         try:
             # named_blocks maps from names to _NamedBlock objects
             named_blocks = {}
@@ -271,9 +353,8 @@ class Template(object):
             ancestors.reverse()
             for ancestor in ancestors:
                 ancestor.find_named_blocks(loader, named_blocks)
-            self.file.find_named_blocks(loader, named_blocks)
-            writer = _CodeWriter(buffer, named_blocks, loader, ancestors[0].template,
-                                 compress_whitespace)
+            writer = _CodeWriter(buffer, named_blocks, loader,
+                                 ancestors[0].template)
             ancestors[0].generate(writer)
             return buffer.getvalue()
         finally:
@@ -292,18 +373,32 @@ class Template(object):
 
 
 class BaseLoader(object):
-    """Base class for template loaders."""
-    def __init__(self, autoescape=_DEFAULT_AUTOESCAPE, namespace=None):
-        """Creates a template loader.
+    """Base class for template loaders.
 
-        root_directory may be the empty string if this loader does not
-        use the filesystem.
+    You must use a template loader to use template constructs like
+    ``{% extends %}`` and ``{% include %}``. The loader caches all
+    templates after they are loaded the first time.
+    """
+    def __init__(self, autoescape=_DEFAULT_AUTOESCAPE, namespace=None,
+                 whitespace=None):
+        """Construct a template loader.
 
-        autoescape must be either None or a string naming a function
-        in the template namespace, such as "xhtml_escape".
+        :arg str autoescape: The name of a function in the template
+            namespace, such as "xhtml_escape", or ``None`` to disable
+            autoescaping by default.
+        :arg dict namespace: A dictionary to be added to the default template
+            namespace, or ``None``.
+        :arg str whitespace: A string specifying default behavior for
+            whitespace in templates; see `filter_whitespace` for options.
+            Default is "single" for files ending in ".html" and ".js" and
+            "all" for other files.
+
+        .. versionchanged:: 4.3
+           Added ``whitespace`` parameter.
         """
         self.autoescape = autoescape
         self.namespace = namespace or {}
+        self.whitespace = whitespace
         self.templates = {}
         # self.lock protects self.templates.  It's a reentrant lock
         # because templates may load other templates via `include` or
@@ -335,10 +430,6 @@ class BaseLoader(object):
 
 class Loader(BaseLoader):
     """A template loader that loads from a single root directory.
-
-    You must use a template loader to use template constructs like
-    {% extends %} and {% include %}. Loader caches all templates after
-    they are loaded the first time.
     """
     def __init__(self, root_directory, **kwargs):
         super(Loader, self).__init__(**kwargs)
@@ -346,8 +437,8 @@ class Loader(BaseLoader):
 
     def resolve_path(self, name, parent_path=None):
         if parent_path and not parent_path.startswith("<") and \
-           not parent_path.startswith("/") and \
-           not name.startswith("/"):
+            not parent_path.startswith("/") and \
+                not name.startswith("/"):
             current_path = os.path.join(self.root, parent_path)
             file_dir = os.path.dirname(os.path.abspath(current_path))
             relative_path = os.path.abspath(os.path.join(file_dir, name))
@@ -357,10 +448,9 @@ class Loader(BaseLoader):
 
     def _create_template(self, name):
         path = os.path.join(self.root, name)
-        f = open(path, "rb")
-        template = Template(f.read(), name=name, loader=self)
-        f.close()
-        return template
+        with open(path, "rb") as f:
+            template = Template(f.read(), name=name, loader=self)
+            return template
 
 
 class DictLoader(BaseLoader):
@@ -371,8 +461,8 @@ class DictLoader(BaseLoader):
 
     def resolve_path(self, name, parent_path=None):
         if parent_path and not parent_path.startswith("<") and \
-           not parent_path.startswith("/") and \
-           not name.startswith("/"):
+            not parent_path.startswith("/") and \
+                not name.startswith("/"):
             file_dir = posixpath.dirname(parent_path)
             name = posixpath.normpath(posixpath.join(file_dir, name))
         return name
@@ -400,12 +490,12 @@ class _File(_Node):
         self.line = 0
 
     def generate(self, writer):
-        writer.write_line("def _execute():", self.line)
+        writer.write_line("def _tt_execute():", self.line)
         with writer.indent():
-            writer.write_line("_buffer = []", self.line)
-            writer.write_line("_append = _buffer.append", self.line)
+            writer.write_line("_tt_buffer = []", self.line)
+            writer.write_line("_tt_append = _tt_buffer.append", self.line)
             self.body.generate(writer)
-            writer.write_line("return _utf8('').join(_buffer)", self.line)
+            writer.write_line("return _tt_utf8('').join(_tt_buffer)", self.line)
 
     def each_child(self):
         return (self.body,)
@@ -474,15 +564,15 @@ class _ApplyBlock(_Node):
         return (self.body,)
 
     def generate(self, writer):
-        method_name = "apply%d" % writer.apply_counter
+        method_name = "_tt_apply%d" % writer.apply_counter
         writer.apply_counter += 1
         writer.write_line("def %s():" % method_name, self.line)
         with writer.indent():
-            writer.write_line("_buffer = []", self.line)
-            writer.write_line("_append = _buffer.append", self.line)
+            writer.write_line("_tt_buffer = []", self.line)
+            writer.write_line("_tt_append = _tt_buffer.append", self.line)
             self.body.generate(writer)
-            writer.write_line("return _utf8('').join(_buffer)", self.line)
-        writer.write_line("_append(_utf8(%s(%s())))" % (
+            writer.write_line("return _tt_utf8('').join(_tt_buffer)", self.line)
+        writer.write_line("_tt_append(_tt_utf8(%s(%s())))" % (
             self.method, method_name), self.line)
 
 
@@ -530,56 +620,68 @@ class _Expression(_Node):
         self.raw = raw
 
     def generate(self, writer):
-        writer.write_line("_tmp = %s" % self.expression, self.line)
-        writer.write_line("if isinstance(_tmp, _string_types):"
-                          " _tmp = _utf8(_tmp)", self.line)
-        writer.write_line("else: _tmp = _utf8(str(_tmp))", self.line)
+        writer.write_line("_tt_tmp = %s" % self.expression, self.line)
+        writer.write_line("if isinstance(_tt_tmp, _tt_string_types):"
+                          " _tt_tmp = _tt_utf8(_tt_tmp)", self.line)
+        writer.write_line("else: _tt_tmp = _tt_utf8(str(_tt_tmp))", self.line)
         if not self.raw and writer.current_template.autoescape is not None:
             # In python3 functions like xhtml_escape return unicode,
             # so we have to convert to utf8 again.
-            writer.write_line("_tmp = _utf8(%s(_tmp))" %
+            writer.write_line("_tt_tmp = _tt_utf8(%s(_tt_tmp))" %
                               writer.current_template.autoescape, self.line)
-        writer.write_line("_append(_tmp)", self.line)
+        writer.write_line("_tt_append(_tt_tmp)", self.line)
 
 
 class _Module(_Expression):
     def __init__(self, expression, line):
-        super(_Module, self).__init__("_modules." + expression, line,
+        super(_Module, self).__init__("_tt_modules." + expression, line,
                                       raw=True)
 
 
 class _Text(_Node):
-    def __init__(self, value, line):
+    def __init__(self, value, line, whitespace):
         self.value = value
         self.line = line
+        self.whitespace = whitespace
 
     def generate(self, writer):
         value = self.value
 
-        # Compress lots of white space to a single character. If the whitespace
-        # breaks a line, have it continue to break a line, but just with a
-        # single \n character
-        if writer.compress_whitespace and "<pre>" not in value:
-            value = re.sub(r"([\t ]+)", " ", value)
-            value = re.sub(r"(\s*\n\s*)", "\n", value)
+        # Compress whitespace if requested, with a crude heuristic to avoid
+        # altering preformatted whitespace.
+        if "<pre>" not in value:
+            value = filter_whitespace(self.whitespace, value)
 
         if value:
-            writer.write_line('_append(%r)' % escape.utf8(value), self.line)
+            writer.write_line('_tt_append(%r)' % escape.utf8(value), self.line)
 
 
 class ParseError(Exception):
-    """Raised for template syntax errors."""
-    pass
+    """Raised for template syntax errors.
+
+    ``ParseError`` instances have ``filename`` and ``lineno`` attributes
+    indicating the position of the error.
+
+    .. versionchanged:: 4.3
+       Added ``filename`` and ``lineno`` attributes.
+    """
+    def __init__(self, message, filename, lineno):
+        self.message = message
+        # The names "filename" and "lineno" are chosen for consistency
+        # with python SyntaxError.
+        self.filename = filename
+        self.lineno = lineno
+
+    def __str__(self):
+        return '%s at %s:%d' % (self.message, self.filename, self.lineno)
 
 
 class _CodeWriter(object):
-    def __init__(self, file, named_blocks, loader, current_template,
-                 compress_whitespace):
+    def __init__(self, file, named_blocks, loader, current_template):
         self.file = file
         self.named_blocks = named_blocks
         self.loader = loader
         self.current_template = current_template
-        self.compress_whitespace = compress_whitespace
         self.apply_counter = 0
         self.include_stack = []
         self._indent = 0
@@ -613,20 +715,21 @@ class _CodeWriter(object):
         return IncludeTemplate()
 
     def write_line(self, line, line_number, indent=None):
-        if indent == None:
+        if indent is None:
             indent = self._indent
         line_comment = '  # %s:%d' % (self.current_template.name, line_number)
         if self.include_stack:
             ancestors = ["%s:%d" % (tmpl.name, lineno)
                          for (tmpl, lineno) in self.include_stack]
             line_comment += ' (via %s)' % ', '.join(reversed(ancestors))
-        print >> self.file, "    " * indent + line + line_comment
+        print("    " * indent + line + line_comment, file=self.file)
 
 
 class _TemplateReader(object):
-    def __init__(self, name, text):
+    def __init__(self, name, text, whitespace):
         self.name = name
         self.text = text
+        self.whitespace = whitespace
         self.line = 1
         self.pos = 0
 
@@ -678,6 +781,9 @@ class _TemplateReader(object):
     def __str__(self):
         return self.text[self.pos:]
 
+    def raise_parse_error(self, msg):
+        raise ParseError(msg, self.name, self.line)
+
 
 def _format_code(code):
     lines = code.splitlines()
@@ -695,9 +801,10 @@ def _parse(reader, template, in_block=None, in_loop=None):
             if curly == -1 or curly + 1 == reader.remaining():
                 # EOF
                 if in_block:
-                    raise ParseError("Missing {%% end %%} block for %s" %
-                                     in_block)
-                body.chunks.append(_Text(reader.consume(), reader.line))
+                    reader.raise_parse_error(
+                        "Missing {%% end %%} block for %s" % in_block)
+                body.chunks.append(_Text(reader.consume(), reader.line,
+                                         reader.whitespace))
                 return body
             # If the first curly brace is not the start of a special token,
             # start searching from the character after it
@@ -708,7 +815,7 @@ def _parse(reader, template, in_block=None, in_loop=None):
             # innermost ones.  This is useful when generating languages
             # like latex where curlies are also meaningful
             if (curly + 2 < reader.remaining() and
-                reader[curly + 1] == '{' and reader[curly + 2] == '{'):
+                    reader[curly + 1] == '{' and reader[curly + 2] == '{'):
                 curly += 1
                 continue
             break
@@ -716,7 +823,8 @@ def _parse(reader, template, in_block=None, in_loop=None):
         # Append any text before the special token
         if curly > 0:
             cons = reader.consume(curly)
-            body.chunks.append(_Text(cons, reader.line))
+            body.chunks.append(_Text(cons, reader.line,
+                                     reader.whitespace))
 
         start_brace = reader.consume(2)
         line = reader.line
@@ -727,14 +835,15 @@ def _parse(reader, template, in_block=None, in_loop=None):
         # which also use double braces.
         if reader.remaining() and reader[0] == "!":
             reader.consume(1)
-            body.chunks.append(_Text(start_brace, line))
+            body.chunks.append(_Text(start_brace, line,
+                                     reader.whitespace))
             continue
 
         # Comment
         if start_brace == "{#":
             end = reader.find("#}")
             if end == -1:
-                raise ParseError("Missing end expression #} on line %d" % line)
+                reader.raise_parse_error("Missing end comment #}")
             contents = reader.consume(end).strip()
             reader.consume(2)
             continue
@@ -743,11 +852,11 @@ def _parse(reader, template, in_block=None, in_loop=None):
         if start_brace == "{{":
             end = reader.find("}}")
             if end == -1:
-                raise ParseError("Missing end expression }} on line %d" % line)
+                reader.raise_parse_error("Missing end expression }}")
             contents = reader.consume(end).strip()
             reader.consume(2)
             if not contents:
-                raise ParseError("Empty expression on line %d" % line)
+                reader.raise_parse_error("Empty expression")
             body.chunks.append(_Expression(contents, line))
             continue
 
@@ -755,11 +864,11 @@ def _parse(reader, template, in_block=None, in_loop=None):
         assert start_brace == "{%", start_brace
         end = reader.find("%}")
         if end == -1:
-            raise ParseError("Missing end block %%} on line %d" % line)
+            reader.raise_parse_error("Missing end block %}")
         contents = reader.consume(end).strip()
         reader.consume(2)
         if not contents:
-            raise ParseError("Empty block tag ({%% %%}) on line %d" % line)
+            reader.raise_parse_error("Empty block tag ({% %})")
 
         operator, space, suffix = contents.partition(" ")
         suffix = suffix.strip()
@@ -774,46 +883,55 @@ def _parse(reader, template, in_block=None, in_loop=None):
         allowed_parents = intermediate_blocks.get(operator)
         if allowed_parents is not None:
             if not in_block:
-                raise ParseError("%s outside %s block" %
-                            (operator, allowed_parents))
+                reader.raise_parse_error("%s outside %s block" %
+                                         (operator, allowed_parents))
             if in_block not in allowed_parents:
-                raise ParseError("%s block cannot be attached to %s block" % (operator, in_block))
+                reader.raise_parse_error(
+                    "%s block cannot be attached to %s block" %
+                    (operator, in_block))
             body.chunks.append(_IntermediateControlBlock(contents, line))
             continue
 
         # End tag
         elif operator == "end":
             if not in_block:
-                raise ParseError("Extra {%% end %%} block on line %d" % line)
+                reader.raise_parse_error("Extra {% end %} block")
             return body
 
         elif operator in ("extends", "include", "set", "import", "from",
-                          "comment", "autoescape", "raw", "module"):
+                          "comment", "autoescape", "whitespace", "raw",
+                          "module"):
             if operator == "comment":
                 continue
             if operator == "extends":
                 suffix = suffix.strip('"').strip("'")
                 if not suffix:
-                    raise ParseError("extends missing file path on line %d" % line)
+                    reader.raise_parse_error("extends missing file path")
                 block = _ExtendsBlock(suffix)
             elif operator in ("import", "from"):
                 if not suffix:
-                    raise ParseError("import missing statement on line %d" % line)
+                    reader.raise_parse_error("import missing statement")
                 block = _Statement(contents, line)
             elif operator == "include":
                 suffix = suffix.strip('"').strip("'")
                 if not suffix:
-                    raise ParseError("include missing file path on line %d" % line)
+                    reader.raise_parse_error("include missing file path")
                 block = _IncludeBlock(suffix, reader, line)
             elif operator == "set":
                 if not suffix:
-                    raise ParseError("set missing statement on line %d" % line)
+                    reader.raise_parse_error("set missing statement")
                 block = _Statement(suffix, line)
             elif operator == "autoescape":
                 fn = suffix.strip()
                 if fn == "None":
                     fn = None
                 template.autoescape = fn
+                continue
+            elif operator == "whitespace":
+                mode = suffix.strip()
+                # Validate the selected mode
+                filter_whitespace(mode, '')
+                reader.whitespace = mode
                 continue
             elif operator == "raw":
                 block = _Expression(suffix, line, raw=True)
@@ -835,11 +953,11 @@ def _parse(reader, template, in_block=None, in_loop=None):
 
             if operator == "apply":
                 if not suffix:
-                    raise ParseError("apply missing method name on line %d" % line)
+                    reader.raise_parse_error("apply missing method name")
                 block = _ApplyBlock(suffix, line, block_body)
             elif operator == "block":
                 if not suffix:
-                    raise ParseError("block missing name on line %d" % line)
+                    reader.raise_parse_error("block missing name")
                 block = _NamedBlock(suffix, block_body, template, line)
             else:
                 block = _ControlBlock(contents, line, block_body)
@@ -848,9 +966,10 @@ def _parse(reader, template, in_block=None, in_loop=None):
 
         elif operator in ("break", "continue"):
             if not in_loop:
-                raise ParseError("%s outside %s block" % (operator, set(["for", "while"])))
+                reader.raise_parse_error("%s outside %s block" %
+                                         (operator, set(["for", "while"])))
             body.chunks.append(_Statement(contents, line))
             continue
 
         else:
-            raise ParseError("unknown operator: %r" % operator)
+            reader.raise_parse_error("unknown operator: %r" % operator)

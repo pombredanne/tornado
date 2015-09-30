@@ -14,24 +14,38 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""A module to automatically restart the server when a module is modified.
+"""Automatically restart the server when a source file is modified.
 
-Most applications should not call this module directly.  Instead, pass the
-keyword argument ``debug=True`` to the `tornado.web.Application` constructor.
-This will enable autoreload mode as well as checking for changes to templates
-and static resources.
+Most applications should not access this module directly.  Instead,
+pass the keyword argument ``autoreload=True`` to the
+`tornado.web.Application` constructor (or ``debug=True``, which
+enables this setting and several others).  This will enable autoreload
+mode as well as checking for changes to templates and static
+resources.  Note that restarting is a destructive operation and any
+requests in progress will be aborted when the process restarts.  (If
+you want to disable autoreload while using other debug-mode features,
+pass both ``debug=True`` and ``autoreload=False``).
 
-This module depends on IOLoop, so it will not work in WSGI applications
-and Google AppEngine.  It also will not work correctly when HTTPServer's
+This module can also be used as a command-line wrapper around scripts
+such as unit test runners.  See the `main` method for details.
+
+The command-line wrapper and Application debug modes can be used together.
+This combination is encouraged as the wrapper catches syntax errors and
+other import-time failures, while debug mode catches changes once
+the server has started.
+
+This module depends on `.IOLoop`, so it will not work in WSGI applications
+and Google App Engine.  It also will not work correctly when `.HTTPServer`'s
 multi-process mode is used.
 
 Reloading loses any Python interpreter command-line arguments (e.g. ``-u``)
 because it re-executes Python using ``sys.executable`` and ``sys.argv``.
 Additionally, modifying these variables will cause reloading to behave
 incorrectly.
+
 """
 
-from __future__ import absolute_import, division, with_statement
+from __future__ import absolute_import, division, print_function, with_statement
 
 import os
 import sys
@@ -79,31 +93,42 @@ import weakref
 from tornado import ioloop
 from tornado.log import gen_log
 from tornado import process
+from tornado.util import exec_in
 
 try:
     import signal
 except ImportError:
     signal = None
 
+# os.execv is broken on Windows and can't properly parse command line
+# arguments and executable name if they contain whitespaces. subprocess
+# fixes that behavior.
+# This distinction is also important because when we use execv, we want to
+# close the IOLoop and all its file descriptors, to guard against any
+# file descriptors that were not set CLOEXEC. When execv is not available,
+# we must not close the IOLoop because we want the process to exit cleanly.
+_has_execv = sys.platform != 'win32'
 
 _watched_files = set()
 _reload_hooks = []
 _reload_attempted = False
 _io_loops = weakref.WeakKeyDictionary()
 
-def start(io_loop=None, check_time=500):
-    """Restarts the process automatically when a module is modified.
 
-    We run on the I/O loop, and restarting is a destructive operation,
-    so will terminate any pending requests.
+def start(io_loop=None, check_time=500):
+    """Begins watching source files for changes.
+
+    .. versionchanged:: 4.1
+       The ``io_loop`` argument is deprecated.
     """
-    io_loop = io_loop or ioloop.IOLoop.instance()
+    io_loop = io_loop or ioloop.IOLoop.current()
     if io_loop in _io_loops:
         return
     _io_loops[io_loop] = True
     if len(_io_loops) > 1:
         gen_log.warning("tornado.autoreload started more than once in the same process")
-    add_reload_hook(functools.partial(_close_all_fds, io_loop))
+    if _has_execv:
+        add_reload_hook(functools.partial(io_loop.close, all_fds=True))
     modify_times = {}
     callback = functools.partial(_reload_on_update, modify_times)
     scheduler = ioloop.PeriodicCallback(callback, check_time, io_loop=io_loop)
@@ -135,18 +160,10 @@ def add_reload_hook(fn):
 
     Note that for open file and socket handles it is generally
     preferable to set the ``FD_CLOEXEC`` flag (using `fcntl` or
-    `tornado.platform.auto.set_close_exec`) instead of using a reload
-    hook to close them.
+    ``tornado.platform.auto.set_close_exec``) instead
+    of using a reload hook to close them.
     """
     _reload_hooks.append(fn)
-
-
-def _close_all_fds(io_loop):
-    for fd in io_loop._handlers.keys():
-        try:
-            os.close(fd)
-        except Exception:
-            pass
 
 
 def _reload_on_update(modify_times):
@@ -158,7 +175,7 @@ def _reload_on_update(modify_times):
         # processes restarted themselves, they'd all restart and then
         # all call fork_processes again.
         return
-    for module in sys.modules.values():
+    for module in list(sys.modules.values()):
         # Some modules play games with sys.modules (e.g. email/__init__.py
         # in the standard library), and occasionally this can cause strange
         # failures in getattr.  Just ignore anything that's not an ordinary
@@ -204,13 +221,10 @@ def _reload():
     # to ensure that the new process sees the same path we did.
     path_prefix = '.' + os.pathsep
     if (sys.path[0] == '' and
-        not os.environ.get("PYTHONPATH", "").startswith(path_prefix)):
+            not os.environ.get("PYTHONPATH", "").startswith(path_prefix)):
         os.environ["PYTHONPATH"] = (path_prefix +
                                     os.environ.get("PYTHONPATH", ""))
-    if sys.platform == 'win32':
-        # os.execv is broken on Windows and can't properly parse command line
-        # arguments and executable name if they contain whitespaces. subprocess
-        # fixes that behavior.
+    if not _has_execv:
         subprocess.Popen([sys.executable] + sys.argv)
         sys.exit(0)
     else:
@@ -230,7 +244,10 @@ def _reload():
             # this error specifically.
             os.spawnv(os.P_NOWAIT, sys.executable,
                       [sys.executable] + sys.argv)
-            sys.exit(0)
+            # At this point the IOLoop has been closed and finally
+            # blocks will experience errors if we allow the stack to
+            # unwind, so just exit uncleanly.
+            os._exit(0)
 
 _USAGE = """\
 Usage:
@@ -263,7 +280,7 @@ def main():
         script = sys.argv[1]
         sys.argv = sys.argv[1:]
     else:
-        print >>sys.stderr, _USAGE
+        print(_USAGE, file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -272,16 +289,21 @@ def main():
             runpy.run_module(module, run_name="__main__", alter_sys=True)
         elif mode == "script":
             with open(script) as f:
+                # Execute the script in our namespace instead of creating
+                # a new one so that something that tries to import __main__
+                # (e.g. the unittest module) will see names defined in the
+                # script instead of just those defined in this module.
                 global __file__
                 __file__ = script
-                # Use globals as our "locals" dictionary so that
-                # something that tries to import __main__ (e.g. the unittest
-                # module) will see the right things.
-                exec f.read() in globals(), globals()
-    except SystemExit, e:
+                # If __package__ is defined, imports may be incorrectly
+                # interpreted as relative to this module.
+                global __package__
+                del __package__
+                exec_in(f.read(), globals(), globals())
+    except SystemExit as e:
         logging.basicConfig()
         gen_log.info("Script exited with status %s", e.code)
-    except Exception, e:
+    except Exception as e:
         logging.basicConfig()
         gen_log.warning("Script exited with uncaught exception", exc_info=True)
         # If an exception occurred at import time, the file with the error
